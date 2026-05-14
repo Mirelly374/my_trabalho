@@ -1,0 +1,18 @@
+cofre-digital-deploy/
+│
+├── app/
+│   ├── app.py
+│   ├── requirements.txt
+│   ├── security_utils.py
+│   └── database.py
+│
+├── docker/
+│   └── Dockerfile
+│
+├── .github/
+│   └── workflows/
+│       └── deploy.yml
+│
+├── docker-compose.yml
+├── test_local.sh
+└── README.md
