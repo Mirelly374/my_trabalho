@@ -16,3 +16,258 @@ cofre-digital-deploy/
 ├── docker-compose.yml
 ├── test_local.sh
 └── README.md
+from flask import Flask, jsonify
+import os
+import logging
+
+app = Flask(__name__)
+
+logging.basicConfig(level=logging.INFO)
+logger = logging.getLogger(__name__)
+
+@app.route('/')
+def home():
+    return jsonify({
+        "message": "Cofre Digital Online!",
+        "environment": os.getenv('ENVIRONMENT', 'unknown'),
+        "version": os.getenv('APP_VERSION', '1.0.0')
+    })
+
+@app.route('/database')
+def database_info():
+    db_host = os.getenv('DB_HOST', 'localhost')
+    db_user = os.getenv('DB_USER', 'user')
+    db_password = os.getenv('DB_PASSWORD', 'SENHA_NAO_CONFIGURADA')
+
+    logger.info(f"Conectando ao banco: {db_host} com usuário: {db_user}")
+
+    return jsonify({
+        "status": "connected" if db_password != 'SENHA_NAO_CONFIGURADA' else "not_configured",
+        "host": db_host,
+        "user": db_user,
+        "password_configured": db_password != 'SENHA_NAO_CONFIGURADA'
+    })
+
+@app.route('/api-key')
+def api_key_info():
+    api_key = os.getenv('EXTERNAL_API_KEY', 'KEY_NAO_CONFIGURADA')
+
+    masked_key = api_key[:4] + "*" * (len(api_key) - 8) + api_key[-4:] if len(api_key) > 8 else "****"
+
+    logger.info(f"Usando API Key: {masked_key}")
+
+    return jsonify({
+        "api_configured": api_key != 'KEY_NAO_CONFIGURADA',
+        "key_preview": masked_key
+    })
+
+if __name__ == '__main__':
+    port = int(os.getenv('PORT', 5000))
+    app.run(host='0.0.0.0', port=port, debug=False)
+Flask==2.3.3
+gunicorn==21.2.0
+import re
+import logging
+from functools import wraps
+
+class SecureLogger:
+    def __init__(self, logger_name):
+        self.logger = logging.getLogger(logger_name)
+
+        self.sensitive_patterns = [
+            (r'password["\\s]*[:=]["\\s]*([^"\\s,}]+)', r'password="***MASKED***"'),
+            (r'api[_-]?key["\\s]*[:=]["\\s]*([^"\\s,}]+)', r'api_key="***MASKED***"'),
+            (r'token["\\s]*[:=]["\\s]*([^"\\s,}]+)', r'token="***MASKED***"'),
+            (r'secret["\\s]*[:=]["\\s]*([^"\\s,}]+)', r'secret="***MASKED***"'),
+        ]
+
+    def _mask_sensitive_data(self, message):
+        for pattern, replacement in self.sensitive_patterns:
+            message = re.sub(pattern, replacement, message, flags=re.IGNORECASE)
+        return message
+
+    def info(self, message):
+        self.logger.info(self._mask_sensitive_data(str(message)))
+
+    def error(self, message):
+        self.logger.error(self._mask_sensitive_data(str(message)))
+
+def mask_secret(secret, visible_chars=4):
+    if not secret or len(secret) <= visible_chars * 2:
+        return "***MASKED***"
+
+    return secret[:visible_chars] + "*" * (len(secret) - visible_chars * 2) + secret[-visible_chars:]
+
+def secure_log_decorator(func):
+    @wraps(func)
+    def wrapper(*args, **kwargs):
+        secure_logger = SecureLogger(func.__module__)
+
+        safe_kwargs = {}
+
+        for key, value in kwargs.items():
+            if any(sensitive in key.lower() for sensitive in ['password', 'key', 'token', 'secret']):
+                safe_kwargs[key] = mask_secret(str(value))
+            else:
+                safe_kwargs[key] = value
+
+        secure_logger.info(f"Executando {func.__name__} com args: {safe_kwargs}")
+
+        result = func(*args, **kwargs)
+
+        secure_logger.info(f"{func.__name__} executado com sucesso")
+
+        return result
+
+    return wrapper
+from security_utils import SecureLogger, secure_log_decorator, mask_secret
+import os
+
+secure_logger = SecureLogger(__name__)
+
+@secure_log_decorator
+def connect_database(host, user, password, database):
+    secure_logger.info(f"Conectando ao banco {database} em {host}")
+    secure_logger.info(f"Usuário: {user}")
+    secure_logger.info(f"Senha configurada: {password is not None}")
+
+    connection_string = f"postgresql://{user}:{mask_secret(password)}@{host}/{database}"
+
+    secure_logger.info(f"String de conexão: {connection_string}")
+
+    return {
+        "status": "connected",
+        "host": host,
+        "user": user
+    }
+
+if __name__ == "__main__":
+    db_config = {
+        "host": os.getenv("DB_HOST", "localhost"),
+        "user": os.getenv("DB_USER", "user"),
+        "password": os.getenv("DB_PASSWORD", "password"),
+        "database": "cofre_digital"
+    }
+
+    connect_database(**db_config)
+FROM python:3.11-slim
+
+RUN useradd --create-home --shell /bin/bash appuser
+
+WORKDIR /app
+
+COPY app/requirements.txt .
+
+RUN pip install --no-cache-dir -r requirements.txt
+
+COPY app/ .
+
+USER appuser
+
+EXPOSE 5000
+
+CMD ["gunicorn", "--bind", "0.0.0.0:5000", "--workers", "2", "app:app"]
+version: '3.8'
+
+services:
+  app:
+    build:
+      context: .
+      dockerfile: docker/Dockerfile
+
+    ports:
+      - "5000:5000"
+
+    environment:
+      - ENVIRONMENT=development
+      - APP_VERSION=1.0.0
+      - DB_HOST=localhost
+      - DB_USER=dev_user
+      - DB_PASSWORD=dev_password_123
+      - EXTERNAL_API_KEY=dev_key_abcd1234efgh5678
+      - PORT=5000
+
+    volumes:
+      - ./app:/app
+name: Cofre Digital - Deploy Automatizado
+
+on:
+  push:
+    branches: [ main, develop ]
+
+env:
+  REGISTRY: docker.io
+  IMAGE_NAME: cofre-digital-app
+
+jobs:
+  build:
+    runs-on: ubuntu-latest
+
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+
+      - name: Login Docker Hub
+        uses: docker/login-action@v3
+        with:
+          username: ${{ secrets.DOCKER_USERNAME }}
+          password: ${{ secrets.DOCKER_PASSWORD }}
+
+      - name: Build Docker Image
+        uses: docker/build-push-action@v5
+        with:
+          context: .
+          file: ./docker/Dockerfile
+          push: false
+
+  security-check:
+    runs-on: ubuntu-latest
+
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+
+      - name: Verificar vazamento de secrets
+        run: |
+          echo "Verificando segurança..."
+#!/bin/bash
+
+echo "Testando Cofre Digital Localmente..."
+
+docker build -f docker/Dockerfile -t cofre-digital-local .
+
+docker run -d --name cofre-test \
+  -p 5000:5000 \
+  -e ENVIRONMENT=test \
+  -e DB_HOST=test-db.local \
+  -e DB_USER=test_user \
+  -e DB_PASSWORD=test_password_123 \
+  -e EXTERNAL_API_KEY=test_key_abcd1234 \
+  cofre-digital-local
+
+sleep 5
+
+curl -s http://localhost:5000/
+
+docker stop cofre-test
+docker rm cofre-test
+
+echo "Teste concluído!"
+# Cofre Digital Deploy
+
+Projeto de segurança utilizando:
+- Python Flask
+- Docker
+- GitHub Actions
+- Secrets
+- Deploy Automatizado
+
+## Como executar
+
+docker-compose up --build
+git init
+git add .
+git commit -m "Primeiro commit"
+git branch -M main
+git remote add origin https://github.com/SEU_USUARIO/cofre-digital-deploy.git
+git push -u origin main
